@@ -21,6 +21,8 @@ use crate::{
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
         set_min_price_storage, set_pending_admin_storage,
+        get_bid_history_cap_storage, set_bid_history_cap_storage,
+        DEFAULT_BID_HISTORY_CAP, MAX_BID_HISTORY_CAP,
     },
     types::{
         Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError,
@@ -59,10 +61,15 @@ const MAX_BATCH_CANCEL: u32 = 10;
 
 /// Maximum number of bid records retained per auction in the on-chain history.
 ///
-/// When a new bid is placed and the history already holds `BID_HISTORY_CAP`
-/// entries, the oldest entry is evicted so storage growth is strictly bounded.
-/// Exposed via `get_auction_bids` for contract-side verification and frontend
-/// fallback.
+/// This compile-time constant is the **legacy** default retained for backward
+/// compatibility only.  The authoritative default is
+/// `storage::DEFAULT_BID_HISTORY_CAP` (50).  New auctions snapshot the
+/// *admin-configured* global cap at creation time into `Auction::bid_history_cap`
+/// so that the ring-buffer logic reads the per-auction cap rather than this
+/// constant.  The constant is no longer read in `place_bid`; it remains here
+/// solely to avoid breaking any external code that may reference it.
+#[deprecated(since = "1.2.0", note = "Use storage::get_bid_history_cap_storage() instead")]
+#[allow(dead_code)]
 const BID_HISTORY_CAP: u32 = 20;
 const MAX_OFFERS_PER_LISTING: u32 = 50;
 
@@ -397,6 +404,42 @@ impl MarketplaceContract {
 
     pub fn get_auction_extension_trigger(env: Env) -> u64 {
         get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER)
+    }
+
+    /// Set the global default bid history cap for new auctions.
+    ///
+    /// # Semantics
+    /// The cap is stored globally and snapshotted into each new `Auction` at
+    /// creation time.  Changing the global does NOT affect auctions that are
+    /// already in progress — their `bid_history_cap` field was fixed at
+    /// creation.
+    ///
+    /// # Ring-buffer performance note
+    /// The bid history uses a `Vec<BidRecord>` with front-element eviction when
+    /// the cap is exceeded.  This is O(n) in the cap size because every element
+    /// after the removed slot must shift left.  For the allowed cap range of
+    /// 1–200 this is acceptable: the maximum shift is 199 elements, each a
+    /// small fixed-size `BidRecord` struct.  A VecDeque would eliminate the
+    /// shift but Soroban's `Vec` does not expose that API, so the linear shift
+    /// is the correct implementation here.
+    ///
+    /// # Errors
+    /// Panics with `InvalidBidHistoryCap` when `cap` is 0 or greater than
+    /// `MAX_BID_HISTORY_CAP` (200).
+    pub fn set_bid_history_cap(env: Env, admin: Address, cap: u32) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if cap == 0 || cap > MAX_BID_HISTORY_CAP {
+            panic_with_error!(&env, MarketplaceError::InvalidBidHistoryCap);
+        }
+        set_bid_history_cap_storage(&env, cap);
+    }
+
+    /// Return the current global bid history cap (default `DEFAULT_BID_HISTORY_CAP`).
+    pub fn get_bid_history_cap(env: Env) -> u32 {
+        get_bid_history_cap_storage(&env)
     }
 
     // ── Pause ────────────────────────────────────────────────
@@ -929,12 +972,17 @@ impl MarketplaceContract {
         // Snapshot the global protocol fee so settlement math is fixed at
         // creation time — consistent with how listings work (ISSUE-005 parity).
         let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // Snapshot the current global bid history cap so ring-buffer eviction
+        // for this auction uses the cap in force at creation, not whatever the
+        // admin may set later.
+        let bid_history_cap = get_bid_history_cap_storage(&env);
         let auction = Auction {
             auction_id, creator: creator.clone(), token: token.clone(),
             collection: collection.clone(), token_id, reserve_price,
             highest_bid: 0, highest_bidder: None, end_time,
             status: AuctionStatus::Active, recipients,
             min_increment, extension_window, extension_trigger, protocol_fee_bps,
+            bid_history_cap,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -983,7 +1031,7 @@ impl MarketplaceContract {
         save_auction(&env, &auction);
         append_bid_record(&env, auction_id,
             &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-            BID_HISTORY_CAP,
+            auction.bid_history_cap,
         );
         BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
         if extended {

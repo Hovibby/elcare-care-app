@@ -96,7 +96,7 @@ fn persistent_ttl_is_extended_on_burn_balance_key() {
     let token_id = client.mint(&alice, &String::from_str(&env, "uri"));
     // NormalNFT721's burn() path checks explicit approval (via Approved(token_id)),
     // so set a self-approval first to keep this test focused on TTL behavior.
-    client.approve(&alice, &alice, &token_id);
+    client.approve(&alice, &alice, &token_id, &None);
     client.burn(&alice, &token_id);
 
     jump_ledger(&env, 60_000);
@@ -310,7 +310,7 @@ fn transfer_clears_single_token_approval() {
     let charlie = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.approve(&alice, &charlie, &id);
+    client.approve(&alice, &charlie, &id, &None);
 
     // Approval is set before transfer
     let approved_before = env.as_contract(&contract_id, || {
@@ -339,7 +339,7 @@ fn transfer_from_by_approved_spender_succeeds() {
     let spender = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.approve(&alice, &spender, &id);
+    client.approve(&alice, &spender, &id, &None);
 
     client.transfer_from(&spender, &alice, &bob, &id);
     assert_eq!(client.owner_of(&id), bob);
@@ -353,7 +353,7 @@ fn transfer_from_by_operator_succeeds() {
     let operator = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.set_approval_for_all(&alice, &operator, &true);
+    client.set_approval_for_all(&alice, &operator, &true, &None);
 
     client.transfer_from(&operator, &alice, &bob, &id);
     assert_eq!(client.owner_of(&id), bob);
@@ -382,7 +382,7 @@ fn approve_sets_single_token_approval() {
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     assert_eq!(client.get_approved(&id), None);
 
-    client.approve(&alice, &bob, &id);
+    client.approve(&alice, &bob, &id, &None);
     assert_eq!(client.get_approved(&id), Some(bob));
 }
 
@@ -394,7 +394,7 @@ fn approve_by_non_owner_fails() {
     let bob = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    let result = client.try_approve(&eve, &bob, &id);
+    let result = client.try_approve(&eve, &bob, &id, &None);
     assert_eq!(result, Err(Ok(Error::NotApproved)));
 }
 
@@ -405,10 +405,10 @@ fn set_approval_for_all_and_is_approved_for_all() {
     let operator = Address::generate(&env);
 
     assert!(!client.is_approved_for_all(&owner, &operator));
-    client.set_approval_for_all(&owner, &operator, &true);
+    client.set_approval_for_all(&owner, &operator, &true, &None);
     assert!(client.is_approved_for_all(&owner, &operator));
 
-    client.set_approval_for_all(&owner, &operator, &false);
+    client.set_approval_for_all(&owner, &operator, &false, &None);
     assert!(!client.is_approved_for_all(&owner, &operator));
 }
 
@@ -420,10 +420,10 @@ fn operator_can_approve_on_behalf_of_owner() {
     let charlie = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.set_approval_for_all(&alice, &operator, &true);
+    client.set_approval_for_all(&alice, &operator, &true, &None);
 
     // Operator should be able to call approve() for alice's token
-    client.approve(&operator, &charlie, &id);
+    client.approve(&operator, &charlie, &id, &None);
     assert_eq!(client.get_approved(&id), Some(charlie));
 }
 
@@ -438,7 +438,7 @@ fn burn_removes_token_and_decrements_supply_and_balance() {
     assert_eq!(client.total_supply(), 1);
     assert_eq!(client.balance_of(&alice), 1);
 
-    client.approve(&alice, &alice, &id);
+    client.approve(&alice, &alice, &id, &None);
     client.burn(&alice, &id);
 
     assert_eq!(client.total_supply(), 0);
@@ -467,7 +467,7 @@ fn burn_by_approved_spender_succeeds() {
     let spender = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.approve(&alice, &spender, &id);
+    client.approve(&alice, &spender, &id, &None);
     client.burn(&spender, &id);
 
     let result = client.try_owner_of(&id);
@@ -481,7 +481,7 @@ fn burn_by_operator_succeeds() {
     let operator = Address::generate(&env);
 
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.set_approval_for_all(&alice, &operator, &true);
+    client.set_approval_for_all(&alice, &operator, &true, &None);
     client.burn(&operator, &id);
 
     let result = client.try_owner_of(&id);
@@ -1117,7 +1117,7 @@ fn transfer_from_unaffected_when_paused() {
     let bob = Address::generate(&env);
     let spender = Address::generate(&env);
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.approve(&alice, &spender, &id);
+    client.approve(&alice, &spender, &id, &None);
     client.pause();
     client.transfer_from(&spender, &alice, &bob, &id);
     assert_eq!(client.owner_of(&id), bob);
@@ -1128,7 +1128,7 @@ fn burn_unaffected_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
-    client.approve(&alice, &alice, &id);
+    client.approve(&alice, &alice, &id, &None);
     client.pause();
     client.burn(&alice, &id);
     let result = client.try_owner_of(&id);
@@ -1210,4 +1210,328 @@ fn multiple_pause_unpause_cycles_work_correctly() {
     client.mint(&alice, &String::from_str(&env, "uri3"));
 
     assert_eq!(client.total_supply(), 2u64);
+}
+
+// ── Approval expiry — per-token ───────────────────────────────────────────────
+
+/// An approval set with `expires_at = current_sequence + 100` is valid
+/// immediately but must be invisible once the ledger advances past the expiry.
+#[test]
+fn per_token_approval_expires_after_deadline() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Approve with expiry 200 ledger sequences from now (current = 1, expiry = 201).
+    let expiry: u32 = 201;
+    client.approve(&alice, &bob, &id, &Some(expiry));
+
+    // Before expiry — approval is visible.
+    assert_eq!(client.get_approved(&id), Some(bob.clone()));
+
+    // Advance past expiry.
+    jump_ledger(&env, 201); // sequence becomes 202 (> 201)
+
+    // After expiry — get_approved treats it as None.
+    assert_eq!(client.get_approved(&id), None);
+}
+
+/// transfer_from by an address whose per-token approval has expired must fail.
+#[test]
+fn transfer_from_fails_after_per_token_approval_expires() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Grant approval expiring at sequence 50.
+    let expiry: u32 = 50;
+    client.approve(&alice, &spender, &id, &Some(expiry));
+
+    // Advance past expiry (sequence 1 → 51).
+    jump_ledger(&env, 50);
+
+    // transfer_from must now fail with NotApproved.
+    let result = client.try_transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::NotApproved)));
+}
+
+/// A non-expiring approval (None) survives arbitrary ledger advances.
+#[test]
+fn per_token_approval_without_expiry_survives_ledger_advance() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.approve(&alice, &spender, &id, &None);
+
+    // Advance far into the future — approval must still be valid.
+    jump_ledger(&env, 200_000);
+
+    client.transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+// ── Approval expiry — approval-for-all ───────────────────────────────────────
+
+/// An approval-for-all that has expired must no longer be visible via
+/// `is_approved_for_all` and must not allow `transfer_from`.
+#[test]
+fn approval_for_all_expires_after_deadline() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    // Grant operator approval expiring at sequence 100.
+    let expiry: u32 = 100;
+    client.set_approval_for_all(&alice, &operator, &true, &Some(expiry));
+
+    // Before expiry (current sequence = 1): active.
+    assert!(client.is_approved_for_all(&alice, &operator));
+
+    // Advance past expiry.
+    jump_ledger(&env, 100); // sequence becomes 101
+
+    // Expired approval must not be visible.
+    assert!(!client.is_approved_for_all(&alice, &operator));
+}
+
+/// transfer_from by an operator whose approval-for-all has expired must fail.
+#[test]
+fn transfer_from_fails_after_approval_for_all_expires() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Grant expiring at sequence 30.
+    let expiry: u32 = 30;
+    client.set_approval_for_all(&alice, &operator, &true, &Some(expiry));
+
+    // Advance past expiry.
+    jump_ledger(&env, 30); // sequence → 31
+
+    let result = client.try_transfer_from(&operator, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::NotApproved)));
+}
+
+/// Renewing an expired approval-for-all with a new future expiry restores access.
+#[test]
+fn renewing_expired_approval_for_all_restores_access() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Grant expiring at sequence 20.
+    client.set_approval_for_all(&alice, &operator, &true, &Some(20u32));
+    jump_ledger(&env, 20); // expired
+
+    // Renew with a longer expiry.
+    client.set_approval_for_all(&alice, &operator, &true, &Some(500u32));
+    assert!(client.is_approved_for_all(&alice, &operator));
+
+    client.transfer_from(&operator, &alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+/// A non-expiring approval-for-all (`None`) must survive large ledger advances.
+#[test]
+fn approval_for_all_without_expiry_survives_ledger_advance() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.set_approval_for_all(&alice, &operator, &true, &None);
+
+    jump_ledger(&env, 200_000);
+
+    assert!(client.is_approved_for_all(&alice, &operator));
+    client.transfer_from(&operator, &alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+/// Revoking (approved=false) must clear the grant regardless of the stored
+/// expiry value — the entry behaves as absent immediately.
+#[test]
+fn revoking_approval_for_all_works_before_expiry() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Grant with a far-future expiry.
+    client.set_approval_for_all(&alice, &operator, &true, &Some(999_999u32));
+    assert!(client.is_approved_for_all(&alice, &operator));
+
+    // Revoke.
+    client.set_approval_for_all(&alice, &operator, &false, &None);
+    assert!(!client.is_approved_for_all(&alice, &operator));
+
+    // transfer_from must now fail.
+    let result = client.try_transfer_from(&operator, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::NotApproved)));
+}
+
+// ── revoke_all_approvals ──────────────────────────────────────────────────────
+
+/// `revoke_all_approvals` by the token owner clears the per-token approval so
+/// subsequent `transfer_from` calls by the previously-approved address fail.
+#[test]
+fn revoke_all_approvals_clears_per_token_approval() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.approve(&alice, &spender, &id, &None);
+    assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+    // Revoke all approvals for this token.
+    client.revoke_all_approvals(&alice, &id);
+
+    // Approval must now be gone.
+    assert_eq!(client.get_approved(&id), None);
+
+    // transfer_from must fail.
+    let result = client.try_transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::NotApproved)));
+}
+
+/// `revoke_all_approvals` called when no approval exists must be a no-op
+/// (must not panic).
+#[test]
+fn revoke_all_approvals_is_noop_when_no_approval_set() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    // No approval set — must succeed silently.
+    client.revoke_all_approvals(&alice, &id);
+    assert_eq!(client.get_approved(&id), None);
+}
+
+/// `revoke_all_approvals` called by a non-owner must fail with `NotOwner`.
+#[test]
+fn revoke_all_approvals_by_non_owner_fails() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let eve = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    let result = client.try_revoke_all_approvals(&eve, &id);
+    assert_eq!(result, Err(Ok(Error::NotOwner)));
+}
+
+/// `revoke_all_approvals` on a non-existent token must fail with `TokenNotFound`.
+#[test]
+fn revoke_all_approvals_on_nonexistent_token_fails() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    let result = client.try_revoke_all_approvals(&alice, &999u64);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+/// After `revoke_all_approvals`, a new approval can be re-granted and is active.
+#[test]
+fn re_approve_after_revoke_all_approvals_works() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.approve(&alice, &spender, &id, &None);
+    client.revoke_all_approvals(&alice, &id);
+    assert_eq!(client.get_approved(&id), None);
+
+    // Re-approve.
+    client.approve(&alice, &spender, &id, &None);
+    assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+    client.transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+// ── Expiry boundary conditions ────────────────────────────────────────────────
+
+/// An approval expiring exactly at the current sequence is already expired
+/// (`env.ledger().sequence() >= expires_at` → expired).
+#[test]
+fn approval_expiry_boundary_at_current_sequence_is_expired() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Sequence is 1 after setup. Grant expiry == 1 (boundary: already expired).
+    let expiry: u32 = 1;
+    client.approve(&alice, &spender, &id, &Some(expiry));
+
+    // Sequence is still 1 — `1 >= 1` → expired immediately.
+    assert_eq!(client.get_approved(&id), None);
+
+    let result = client.try_transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::NotApproved)));
+}
+
+/// An approval expiring at sequence `current + 1` is valid at `current` but
+/// expired at `current + 1`.
+#[test]
+fn approval_expiry_one_sequence_ahead_is_valid_then_expires() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+
+    // Current sequence = 1; expiry = 2.
+    let expiry: u32 = 2;
+    client.approve(&alice, &spender, &id, &Some(expiry));
+
+    // Still at sequence 1 — valid.
+    assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+    // Advance to sequence 2 (== expiry) — expired.
+    jump_ledger(&env, 1);
+    assert_eq!(client.get_approved(&id), None);
+}
+
+/// Expiry is stored for approval-for-all and survives a ledger bump that stays
+/// strictly before the deadline.
+#[test]
+fn approval_for_all_expiry_before_deadline_remains_active() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    // Current sequence = 1; expiry = 1_000.
+    client.set_approval_for_all(&alice, &operator, &true, &Some(1_000u32));
+
+    // Advance to sequence 500 — still before deadline.
+    jump_ledger(&env, 499);
+    assert!(client.is_approved_for_all(&alice, &operator));
+
+    // Advance to exactly the deadline (sequence = 1_000) — expired.
+    jump_ledger(&env, 500);
+    assert!(!client.is_approved_for_all(&alice, &operator));
 }

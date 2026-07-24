@@ -13,6 +13,9 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod test_proptest;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,

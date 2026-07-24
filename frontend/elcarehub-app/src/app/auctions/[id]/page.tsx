@@ -8,12 +8,13 @@ import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
-import { getAuction, stroopsToXlm, Auction } from "@/lib/contract";
+import { getAuction, getAuctionBids, stroopsToXlm, Auction, OnChainBidRecord } from "@/lib/contract";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
 import {
-  getListingActivity,
-  ActivityEvent,
   subscribeToMarketplaceEvents,
+  fetchAuctionBids,
+  observeAuctionBidCount,
+  BidHistoryRecord,
 } from "@/lib/indexer";
 import { getReadableErrorMessage } from "@/lib/errors";
 import { useWalletContext } from "@/context/WalletContext";
@@ -36,6 +37,8 @@ import {
   Hash,
   Hammer,
   Flag,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 
 // ── useAuctionCountdown ──────────────────────────────────────
@@ -136,30 +139,143 @@ export function Countdown({ endTime, onExtend }: CountdownProps) {
 
 // ── Bid history row ──────────────────────────────────────────
 
-function BidHistoryRow({ event }: { event: ActivityEvent }) {
-  const amountXlm = (Number(event.price) / 10_000_000).toLocaleString(
-    undefined,
-    { maximumFractionDigits: 4 }
-  );
+/** Unified bid row that accepts either an on-chain or indexer record. */
+function BidHistoryRow({
+  bidder,
+  amountStroops,
+  ledger,
+  timestamp,
+}: {
+  bidder: string;
+  /** Amount in stroops — string or bigint both accepted. */
+  amountStroops: string | bigint;
+  ledger: number;
+  timestamp?: string;
+}) {
+  const amount = typeof amountStroops === "bigint" ? amountStroops : BigInt(amountStroops);
+  const amountXlm = stroopsToXlm(amount);
   const shortAddr = (addr: string) =>
     addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+
+  const timeLabel = timestamp
+    ? new Date(timestamp).toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : `Ledger ${ledger}`;
 
   return (
     <div className="flex items-center justify-between rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm">
       <div className="flex items-center gap-2 text-gray-700 min-w-0">
         <User size={13} className="shrink-0 text-gray-400" />
-        <span className="truncate font-mono text-xs">
-          {shortAddr(event.from)}
+        <span className="truncate font-mono text-xs" title={bidder}>
+          {shortAddr(bidder)}
         </span>
       </div>
       <div className="flex items-center gap-3">
         <span className="font-semibold text-brand-600">{amountXlm} XLM</span>
-        <span className="text-xs text-gray-400">
-          Ledger {event.tx_hash.replace("ledger_", "")}
-        </span>
+        <span className="text-xs text-gray-400">{timeLabel}</span>
       </div>
     </div>
   );
+}
+
+// ── usePaginatedBidHistory ────────────────────────────────────
+//
+// Fetches the auction's bid history with pagination.  Prefers the indexer
+// (richer data: timestamps, full pagination) and falls back to the on-chain
+// `get_auction_bids` read when the indexer is unreachable.
+//
+// The on-chain fallback is paginated client-side because the contract returns
+// the full history Vec (bounded by bid_history_cap ≤ 200 entries).
+
+const BID_PAGE_SIZE = 10;
+
+type NormalisedBid = {
+  key: string;
+  bidder: string;
+  amountStroops: string | bigint;
+  ledger: number;
+  timestamp?: string;
+};
+
+function normaliseBidHistoryRecord(r: BidHistoryRecord, i: number): NormalisedBid {
+  return {
+    key: `idx-${r.ledger}-${i}`,
+    bidder: r.bidder,
+    amountStroops: r.amount,
+    ledger: r.ledger,
+    timestamp: r.timestamp,
+  };
+}
+
+function normaliseOnChainBid(r: OnChainBidRecord, i: number): NormalisedBid {
+  return {
+    key: `chain-${r.ledger}-${i}`,
+    bidder: r.bidder,
+    amountStroops: r.amount,
+    ledger: r.ledger,
+  };
+}
+
+function usePaginatedBidHistory(auctionId: number | null) {
+  const [bids, setBids] = useState<NormalisedBid[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0); // 0-indexed
+  const [isLoadingBids, setIsLoadingBids] = useState(false);
+  const [bidsError, setBidsError] = useState<string | null>(null);
+
+  const totalPages = Math.max(1, Math.ceil(total / BID_PAGE_SIZE));
+
+  const loadPage = useCallback(
+    async (p: number) => {
+      if (auctionId === null) return;
+      setIsLoadingBids(true);
+      setBidsError(null);
+      try {
+        // Prefer indexer — it has timestamps and efficient server-side paging.
+        const result = await fetchAuctionBids(
+          auctionId,
+          p * BID_PAGE_SIZE,
+          BID_PAGE_SIZE,
+        );
+        if (result.bids.length > 0 || result.total > 0) {
+          setBids(result.bids.map(normaliseBidHistoryRecord));
+          setTotal(result.total);
+          return;
+        }
+      } catch {
+        // fall through to on-chain
+      }
+
+      // On-chain fallback: fetch full list and slice client-side.
+      try {
+        const all = await getAuctionBids(auctionId);
+        // Contract returns oldest-first; reverse so newest is at the top.
+        const reversed = [...all].reverse();
+        setTotal(reversed.length);
+        const slice = reversed.slice(p * BID_PAGE_SIZE, (p + 1) * BID_PAGE_SIZE);
+        setBids(slice.map(normaliseOnChainBid));
+      } catch (err) {
+        setBidsError(getReadableErrorMessage(err, "Failed to load bid history"));
+      }
+    },
+    [auctionId],
+  );
+
+  useEffect(() => {
+    loadPage(page);
+  }, [loadPage, page]);
+
+  const goToPage = useCallback(
+    (p: number) => {
+      const clamped = Math.max(0, Math.min(p, totalPages - 1));
+      setPage(clamped);
+    },
+    [totalPages],
+  );
+
+  return { bids, total, page, totalPages, isLoadingBids, bidsError, goToPage, reload: () => loadPage(page) };
 }
 
 // ── Page ─────────────────────────────────────────────────────
@@ -171,7 +287,6 @@ export default function AuctionDetailPage() {
 
   const [auction, setAuction] = useState<Auction | null>(null);
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
-  const [bidHistory, setBidHistory] = useState<ActivityEvent[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
@@ -186,6 +301,19 @@ export default function AuctionDetailPage() {
   const { finalize, isFinalizing, error: finalizeError } =
     useFinalizeAuction(publicKey);
 
+  // Paginated on-chain bid history (with indexer as preferred source).
+  const auctionIdNum = id ? Number(id) : null;
+  const {
+    bids,
+    total: bidTotal,
+    page: bidPage,
+    totalPages: bidTotalPages,
+    isLoadingBids,
+    bidsError,
+    goToPage,
+    reload: reloadBids,
+  } = usePaginatedBidHistory(auctionIdNum);
+
   // ── Data loader ──────────────────────────────────────────
 
   const loadData = useCallback(async () => {
@@ -197,12 +325,8 @@ export default function AuctionDetailPage() {
       setAuction(auctionData);
       setLiveEndTime(auctionData.end_time);
 
-      const [meta, history] = await Promise.all([
-        fetchMetadata(auctionData.metadata_cid).catch(() => null),
-        getListingActivity(Number(id)).catch(() => [] as ActivityEvent[]),
-      ]);
+      const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
       setMetadata(meta);
-      setBidHistory(history);
     } catch (err) {
       setError(getReadableErrorMessage(err, "Failed to load auction"));
     } finally {
@@ -229,9 +353,10 @@ export default function AuctionDetailPage() {
         }
 
         switch (event.type) {
-          // A bid was placed — refresh auction data so highest_bid is up to date.
+          // A bid was placed — refresh auction data and bid history.
           case "BID_PLACED":
             loadData();
+            reloadBids();
             break;
 
           // Auction extended: update endTime in place without a full reload.
@@ -282,6 +407,9 @@ export default function AuctionDetailPage() {
     const ok = await finalize(auction.auction_id);
     if (ok) {
       setFinalizeSuccess(true);
+      // Observe the total bid count in the Prometheus histogram now that the
+      // auction has reached a terminal state and the count is final.
+      observeAuctionBidCount(auction.auction_id, bidTotal);
       loadData();
     }
   };
@@ -604,7 +732,7 @@ export default function AuctionDetailPage() {
                 {t === "details" ? "Details" : "Bid History"}
                 {t === "bids" && (
                   <span className="ml-1.5 text-xs opacity-70">
-                    ({bidHistory.length})
+                    ({bidTotal})
                   </span>
                 )}
               </button>
@@ -649,18 +777,91 @@ export default function AuctionDetailPage() {
           )}
 
           {activeTab === "bids" && (
-            <div className="space-y-2">
-              {bidHistory.length === 0 ? (
+            <div className="space-y-3">
+              {/* Table header */}
+              <div
+                className="grid grid-cols-3 gap-2 rounded-xl bg-gray-50 px-4 py-2 text-[10px] font-bold uppercase tracking-wider text-gray-400"
+                aria-hidden="true"
+              >
+                <span>Bidder</span>
+                <span className="text-right">Amount</span>
+                <span className="text-right">Time / Ledger</span>
+              </div>
+
+              {/* Loading */}
+              {isLoadingBids && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center justify-center gap-2 rounded-xl bg-white border border-gray-100 py-10 text-sm text-gray-400"
+                >
+                  <RefreshCw size={16} className="animate-spin" />
+                  Loading bid history…
+                </div>
+              )}
+
+              {/* Error */}
+              {!isLoadingBids && bidsError && (
+                <div
+                  role="alert"
+                  className="flex items-center gap-2 rounded-xl bg-red-50 border border-red-100 px-4 py-3 text-sm text-red-600"
+                >
+                  <AlertCircle size={14} />
+                  {bidsError}
+                </div>
+              )}
+
+              {/* Empty state */}
+              {!isLoadingBids && !bidsError && bids.length === 0 && (
                 <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-100 bg-white py-16">
                   <History size={32} className="text-gray-300 mb-3" />
-                  <p className="text-sm text-gray-500">
-                    No bid history available
-                  </p>
+                  <p className="text-sm text-gray-500">No bid history yet</p>
                 </div>
-              ) : (
-                bidHistory.map((event) => (
-                  <BidHistoryRow key={event.id} event={event} />
-                ))
+              )}
+
+              {/* Bid rows */}
+              {!isLoadingBids &&
+                !bidsError &&
+                bids.map((b) => (
+                  <BidHistoryRow
+                    key={b.key}
+                    bidder={b.bidder}
+                    amountStroops={b.amountStroops}
+                    ledger={b.ledger}
+                    timestamp={b.timestamp}
+                  />
+                ))}
+
+              {/* Pagination controls */}
+              {!isLoadingBids && !bidsError && bidTotal > BID_PAGE_SIZE && (
+                <nav
+                  aria-label="Bid history pagination"
+                  className="flex items-center justify-between pt-2"
+                >
+                  <span className="text-xs text-gray-400">
+                    Page {bidPage + 1} of {bidTotalPages} &middot; {bidTotal} bids total
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => goToPage(bidPage - 1)}
+                      disabled={bidPage === 0}
+                      aria-label="Previous page"
+                      className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    >
+                      <ChevronLeft size={13} />
+                      Prev
+                    </button>
+                    <button
+                      onClick={() => goToPage(bidPage + 1)}
+                      disabled={bidPage >= bidTotalPages - 1}
+                      aria-label="Next page"
+                      className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    >
+                      Next
+                      <ChevronRight size={13} />
+                    </button>
+                  </div>
+                </nav>
               )}
             </div>
           )}

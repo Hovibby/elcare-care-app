@@ -864,3 +864,108 @@ export async function getAdmin(): Promise<string | null> {
     return null;
   }
 }
+
+// ── NFT collection approval helpers ──────────────────────────
+//
+// These functions interact directly with an NFT *collection* contract
+// (NormalNFT721) rather than the marketplace contract.  They are used by
+// ListingForm to check and grant the marketplace's approval-for-all before
+// a seller can create a listing (the marketplace needs transfer_from rights).
+
+/**
+ * is_approved_for_all — Read-only check on the NFT collection contract.
+ *
+ * Returns `true` when `operator` already has an active (non-expired)
+ * approval-for-all from `owner` on the given collection.
+ */
+export async function isApprovedForAll(
+  collectionAddress: string,
+  ownerPublicKey: string,
+  operatorAddress: string,
+): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [
+      new Address(ownerPublicKey).toScVal(),
+      new Address(operatorAddress).toScVal(),
+    ];
+    const retVal = await invokeContract(
+      callerPublicKey,
+      "is_approved_for_all",
+      args,
+      true,
+      collectionAddress,
+    );
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * set_approval_for_all — Grant the marketplace contract permission to transfer
+ * all NFTs on behalf of the seller.
+ *
+ * Calls `set_approval_for_all(owner, operator, approved=true, expires_at=None)`
+ * on the NFT collection contract.  The `None` expiry means the grant does not
+ * expire (the seller can revoke it any time via `set_approval_for_all(..., false)`).
+ *
+ * @param ownerPublicKey    — The seller's Stellar public key (must be connected via Freighter).
+ * @param collectionAddress — The NFT collection contract address.
+ * @param operatorAddress   — The marketplace contract address to approve.
+ */
+export async function setApprovalForAll(
+  ownerPublicKey: string,
+  collectionAddress: string,
+  operatorAddress: string,
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(ownerPublicKey).toScVal(),
+    new Address(operatorAddress).toScVal(),
+    nativeToScVal(true, { type: "bool" }),
+    // expires_at: None — encoded as void ScVal (Option::None in Soroban)
+    xdr.ScVal.scvVoid(),
+  ];
+  await invokeContract(ownerPublicKey, "set_approval_for_all", args, false, collectionAddress);
+  return true;
+}
+
+// ── On-chain bid history ──────────────────────────────────────
+
+/**
+ * A single bid record as returned by `get_auction_bids` on the marketplace
+ * contract.  Mirrors the Rust `BidRecord` struct.
+ */
+export interface OnChainBidRecord {
+  bidder: string;
+  /** Bid amount in stroops (bigint). */
+  amount: bigint;
+  /** Soroban ledger sequence number at which the bid was recorded. */
+  ledger: number;
+}
+
+function parseBidRecord(raw: unknown): OnChainBidRecord {
+  const obj = scValToNative(raw as xdr.ScVal) as Record<string, unknown>;
+  return {
+    bidder: (obj["bidder"] as Address).toString(),
+    amount: BigInt(obj["amount"] as bigint),
+    ledger: Number(obj["ledger"]),
+  };
+}
+
+/**
+ * get_auction_bids — Fetch the full on-chain bid history for an auction.
+ *
+ * The contract stores at most `auction.bid_history_cap` entries (default 50,
+ * max 200).  This is the authoritative source; use it as a fallback when the
+ * indexer is unreachable.
+ */
+export async function getAuctionBids(
+  auctionId: number,
+): Promise<OnChainBidRecord[]> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  const args: xdr.ScVal[] = [nativeToScVal(BigInt(auctionId), { type: "u64" })];
+  const retVal = await invokeContract(callerPublicKey, "get_auction_bids", args, true);
+  const native = scValToNative(retVal) as unknown[];
+  return native.map(parseBidRecord);
+}
