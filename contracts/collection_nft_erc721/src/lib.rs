@@ -4,6 +4,17 @@
 //! `mint` to issue tokens. Standard transfer / approve / burn logic follows
 //! ERC-721 semantics.  Royalty info (bps + receiver) is stored on-chain so
 //! marketplaces (Litemint, etc.) can query it.
+//!
+//! # Approval expiry
+//!
+//! Both per-token approvals (via `approve`) and collection-wide operator
+//! approvals (via `set_approval_for_all`) accept an optional `expires_at`
+//! ledger-sequence number.  When set, the approval is silently treated as
+//! absent once `env.ledger().sequence() >= expires_at`.  The on-chain entry
+//! is NOT automatically deleted on expiry; it is simply ignored during
+//! `_check_approved` and `is_approved_for_all`.  Callers wishing to clean up
+//! can revoke explicitly with `set_approval_for_all(false)` or
+//! `revoke_all_approvals`.
 #![no_std]
 #![allow(clippy::too_many_arguments, deprecated)]
 
@@ -12,9 +23,16 @@ use soroban_sdk::{
     Vec,
 };
 
+mod events;
+
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
+
+/// Expiry sentinel: a ledger sequence value stored alongside an approval to
+/// indicate "this approval never expires".  Using 0 avoids an extra `Option`
+/// in the storage value while keeping the common case cheap.
+const NO_EXPIRY: u32 = 0;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -54,9 +72,17 @@ pub enum DataKey {
     // Persistent storage — per-token / per-owner, independent TTL
     Owner(u64),
     TokenUri(u64),
+    /// Single approved address for a token.
     Approved(u64),
+    /// Expiry ledger sequence for the per-token approval.
+    /// Stored as u32; value NO_EXPIRY (0) means the approval never expires.
+    ApprovedExpiry(u64),
     BalanceOf(Address),
+    /// Boolean flag: is `operator` approved to transfer all of `owner`'s tokens?
     ApprovedForAll(Address, Address),
+    /// Expiry ledger sequence for an approval-for-all entry.
+    /// Value NO_EXPIRY (0) means the approval never expires.
+    ApprovedForAllExpiry(Address, Address),
     BaseUri,        // String — collection-level base URI (optional)
     MetadataFrozen, // bool   — permanently frozen when true
     // Per-token royalty overrides (persistent, optional)
@@ -304,20 +330,32 @@ impl NormalNFT721 {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
         Self::_check_approved(&env, &spender, &from, token_id)?;
-        // clear single-token approval on transfer
+        // clear single-token approval (and its expiry) on transfer
         env.storage()
             .persistent()
             .remove(&DataKey::Approved(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedExpiry(token_id));
         Self::_transfer(&env, &from, &to, token_id)
     }
 
     // ── Approvals ─────────────────────────────────────────────────────────
 
+    /// Approve `approved` to transfer `token_id`.
+    ///
+    /// # Arguments
+    /// * `spender`    — The caller; must be the token owner or an active operator.
+    /// * `approved`   — The address being granted per-token approval.
+    /// * `token_id`   — The token to approve.
+    /// * `expires_at` — Optional ledger sequence after which the approval lapses.
+    ///                  `None` or `Some(NO_EXPIRY)` means the approval never expires.
     pub fn approve(
         env: Env,
-        spender: Address, // Renamed 'owner' to 'spender' as it identifies the caller
+        spender: Address,
         approved: Address,
         token_id: u64,
+        expires_at: Option<u32>,
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
@@ -329,30 +367,99 @@ impl NormalNFT721 {
 
         // [SECURITY] Allow owner or authorized operator to approve (#48)
         if spender != owner
-            && !Self::is_approved_for_all(env.clone(), owner.clone(), spender.clone())
+            && !Self::_is_approved_for_all_internal(&env, &owner, &spender)
         {
             return Err(Error::NotApproved);
         }
 
+        let expiry = expires_at.unwrap_or(NO_EXPIRY);
         env.storage()
             .persistent()
             .set(&DataKey::Approved(token_id), &approved);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Approved(token_id), 50_000, 100_000);
-        env.events()
-            .publish((symbol_short!("approve"), owner), (approved, token_id));
+            .extend_ttl(&DataKey::Approved(token_id), TTL_THRESHOLD, TTL_BUMP);
+
+        if expiry != NO_EXPIRY {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ApprovedExpiry(token_id), &expiry);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::ApprovedExpiry(token_id), TTL_THRESHOLD, TTL_BUMP);
+        } else {
+            // Clear any previously stored expiry so old limits don't persist.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ApprovedExpiry(token_id));
+        }
+
+        events::emit_approval_set(&env, &owner, &approved, token_id, expiry);
         Ok(())
     }
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    /// Grant or revoke `operator`'s permission to transfer all of `owner`'s tokens.
+    ///
+    /// # Arguments
+    /// * `owner`      — Must sign; the token-holder granting/revoking permission.
+    /// * `operator`   — The address being approved or revoked.
+    /// * `approved`   — `true` to grant, `false` to revoke.
+    /// * `expires_at` — Optional ledger sequence after which the grant lapses.
+    ///                  Ignored when `approved` is `false`.
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
-        env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
-        env.events()
-            .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
+        if approved {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+            let expiry = expires_at.unwrap_or(NO_EXPIRY);
+            if expiry != NO_EXPIRY {
+                env.storage().persistent().set(&expiry_key, &expiry);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            } else {
+                env.storage().persistent().remove(&expiry_key);
+            }
+            events::emit_approval_for_all_set(&env, &owner, &operator, true, expiry);
+        } else {
+            env.storage().persistent().remove(&key);
+            env.storage().persistent().remove(&expiry_key);
+            events::emit_approval_for_all_set(&env, &owner, &operator, false, NO_EXPIRY);
+        }
+    }
+
+    /// Revoke the per-token approval and any approval-for-all grants for `token_id`.
+    /// Callable only by the token owner.  A no-op when no approvals exist.
+    pub fn revoke_all_approvals(env: Env, owner: Address, token_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        owner.require_auth();
+        let token_owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Owner(token_id))
+            .ok_or(Error::TokenNotFound)?;
+        if token_owner != owner {
+            return Err(Error::NotOwner);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Approved(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedExpiry(token_id));
+        events::emit_approval_revoked(&env, &owner, token_id);
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -390,6 +497,9 @@ impl NormalNFT721 {
         env.storage()
             .persistent()
             .remove(&DataKey::Approved(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedExpiry(token_id));
 
         let supply: u64 = env
             .storage()
@@ -536,14 +646,26 @@ impl NormalNFT721 {
     }
 
     pub fn get_approved(env: Env, token_id: u64) -> Option<Address> {
-        env.storage().persistent().get(&DataKey::Approved(token_id))
+        // Return the stored approval only if it has not yet expired.
+        let approved: Option<Address> = env.storage().persistent().get(&DataKey::Approved(token_id));
+        if approved.is_none() {
+            return None;
+        }
+        let expiry: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovedExpiry(token_id))
+            .unwrap_or(NO_EXPIRY);
+        if expiry != NO_EXPIRY && env.ledger().sequence() >= expiry {
+            return None; // expired — treat as unset
+        }
+        approved
     }
 
+    /// Public view: returns `true` iff `operator` has an active (non-expired)
+    /// approval-for-all grant from `owner`.
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ApprovedForAll(owner, operator))
-            .unwrap_or(false)
+        Self::_is_approved_for_all_internal(&env, &owner, &operator)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────
@@ -750,10 +872,13 @@ impl NormalNFT721 {
     }
 
     fn _transfer(env: &Env, from: &Address, to: &Address, token_id: u64) -> Result<(), Error> {
-        // [SECURITY] Clear single-token approval on every transfer (#50)
+        // [SECURITY] Clear single-token approval (and expiry) on every transfer (#50)
         env.storage()
             .persistent()
             .remove(&DataKey::Approved(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ApprovedExpiry(token_id));
 
         let owner: Address = env
             .storage()
@@ -810,26 +935,51 @@ impl NormalNFT721 {
         from: &Address,
         token_id: u64,
     ) -> Result<(), Error> {
-        // Check single-token approval
+        // Check single-token approval (respecting expiry)
         if let Some(approved) = env
             .storage()
             .persistent()
             .get::<DataKey, Address>(&DataKey::Approved(token_id))
         {
             if approved == *spender {
-                return Ok(());
+                let expiry: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::ApprovedExpiry(token_id))
+                    .unwrap_or(NO_EXPIRY);
+                if expiry == NO_EXPIRY || env.ledger().sequence() < expiry {
+                    return Ok(());
+                }
+                // approval exists but has expired — fall through to check operator
             }
         }
-        // Check operator approval
-        if env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::ApprovedForAll(from.clone(), spender.clone()))
-            .unwrap_or(false)
-        {
+        // Check operator approval-for-all (respecting expiry)
+        if Self::_is_approved_for_all_internal(env, from, spender) {
             return Ok(());
         }
         Err(Error::NotApproved)
+    }
+
+    /// Internal expiry-aware check for approval-for-all.  Used by `_check_approved`,
+    /// `approve` (operator branch), and the public `is_approved_for_all`.
+    fn _is_approved_for_all_internal(env: &Env, owner: &Address, operator: &Address) -> bool {
+        let granted: bool = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
+            .unwrap_or(false);
+        if !granted {
+            return false;
+        }
+        let expiry: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+            .unwrap_or(NO_EXPIRY);
+        expiry == NO_EXPIRY || env.ledger().sequence() < expiry
     }
 }
 

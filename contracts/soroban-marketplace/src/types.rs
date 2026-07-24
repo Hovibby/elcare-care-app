@@ -77,6 +77,9 @@ pub enum MarketplaceError {
     PriceOutOfBounds = 39,
     /// A checked arithmetic operation overflowed while computing fee splits.
     ArithmeticOverflow = 40,
+    /// `set_bid_history_cap` was called with a value outside the allowed range
+    /// of 1 – `MAX_BID_HISTORY_CAP` (200).
+    InvalidBidHistoryCap = 41,
 }
 
 #[contracttype]
@@ -150,6 +153,11 @@ pub struct Auction {
     pub extension_window: u64,
     pub extension_trigger: u64,
     pub protocol_fee_bps: u32,
+    /// Maximum number of bid records retained in the on-chain history for this
+    /// auction.  Snapshotted from the global `BID_HISTORY_CAP` at creation
+    /// time so that admin changes to the global cap do not affect in-progress
+    /// auctions.  Range: 1 – `MAX_BID_HISTORY_CAP` (200).
+    pub bid_history_cap: u32,
 }
 
 #[contracttype]

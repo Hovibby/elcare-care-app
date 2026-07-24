@@ -514,6 +514,144 @@ export async function fetchAuctions(options: {
   return [];
 }
 
+// ─────────────────────────────────────────────────────────────
+// Auction bid history — GET /auctions/:id/bids
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * A single bid record as returned by the indexer's
+ * `GET /auctions/:id/bids` endpoint.  Field names mirror the
+ * on-chain `BidRecord` Rust struct stored by `append_bid_record`.
+ */
+export interface BidHistoryRecord {
+  /** Stellar address of the bidder. */
+  bidder: string;
+  /** Bid amount in stroops (raw i128 serialised as a string to avoid JS
+   *  bigint precision loss). */
+  amount: string;
+  /** Soroban ledger sequence number at which the bid was recorded. */
+  ledger: number;
+  /** ISO-8601 timestamp derived from ledger close time (may be absent for
+   *  very recent ledgers where the indexer has not yet enriched the row). */
+  timestamp?: string;
+}
+
+/** Paginated envelope returned by `GET /auctions/:id/bids`. */
+export interface BidHistoryPage {
+  bids: BidHistoryRecord[];
+  /** Total number of bids ever placed (may exceed `bids.length` when paging). */
+  total: number;
+  hasMore: boolean;
+}
+
+/**
+ * Fetch the bid history for an auction from the indexer.
+ *
+ * Endpoint: `GET /auctions/:id/bids?offset=<n>&limit=<n>`
+ *
+ * Falls back gracefully: returns `{ bids: [], total: 0, hasMore: false }` when
+ * the indexer is unreachable so callers can fall back to the on-chain
+ * `get_auction_bids` read.
+ *
+ * @param auctionId - The numeric auction id.
+ * @param offset    - Number of records to skip (default 0, for pagination).
+ * @param limit     - Maximum records to return (default 20).
+ */
+export async function fetchAuctionBids(
+  auctionId: number,
+  offset = 0,
+  limit = 20,
+): Promise<BidHistoryPage> {
+  const empty: BidHistoryPage = { bids: [], total: 0, hasMore: false };
+  if (!Number.isFinite(auctionId)) return empty;
+
+  try {
+    const params = new URLSearchParams({
+      offset: String(offset),
+      limit: String(limit),
+    });
+    const raw = await fetchWithRetry<unknown>(
+      `/auctions/${auctionId}/bids?${params.toString()}`,
+    );
+
+    // Indexer may respond with a plain array or a paginated envelope.
+    if (Array.isArray(raw)) {
+      const bids = raw.filter(isBidHistoryRecord);
+      return { bids, total: offset + bids.length, hasMore: false };
+    }
+
+    if (raw !== null && typeof raw === "object") {
+      const r = raw as Record<string, unknown>;
+      const arr = Array.isArray(r.bids) ? r.bids : Array.isArray(r.data) ? r.data : [];
+      const bids = arr.filter(isBidHistoryRecord);
+      const total = typeof r.total === "number" ? r.total : offset + bids.length;
+      return { bids, total, hasMore: offset + bids.length < total };
+    }
+
+    return empty;
+  } catch (e) {
+    console.warn(
+      "[indexer] fetchAuctionBids:",
+      e instanceof Error ? e.message : e,
+    );
+    return empty;
+  }
+}
+
+function isBidHistoryRecord(v: unknown): v is BidHistoryRecord {
+  if (v === null || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.bidder === "string" &&
+    (typeof o.amount === "string" || typeof o.amount === "number") &&
+    typeof o.ledger === "number"
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Prometheus histogram — elcarehub_auction_bid_count
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Track the distribution of total bids per auction in the client-side
+ * Prometheus histogram `elcarehub_auction_bid_count`.
+ *
+ * This function is intentionally side-effect only (fire-and-forget).  It
+ * posts the observation to the indexer's `/metrics/observe` endpoint so the
+ * server-side Prometheus scrape endpoint picks it up.  Network failures are
+ * swallowed silently to avoid breaking the bidding flow.
+ *
+ * # Server-side setup (reference)
+ * The indexer should register:
+ * ```
+ * const auctionBidCountHistogram = new prom.Histogram({
+ *   name: 'elcarehub_auction_bid_count',
+ *   help: 'Distribution of total bid count per auction at finalization',
+ *   buckets: [1, 5, 10, 20, 50, 100, 200],
+ * });
+ * ```
+ * and handle `POST /metrics/observe` with body `{ metric, value }`.
+ *
+ * @param auctionId  - The auction being observed.
+ * @param totalBids  - The total number of bids placed on this auction.
+ */
+export function observeAuctionBidCount(
+  auctionId: number,
+  totalBids: number,
+): void {
+  if (!Number.isFinite(totalBids) || totalBids < 0) return;
+  // Fire-and-forget: do not await, do not propagate errors.
+  void axios
+    .post(
+      `${config.indexerUrl}/metrics/observe`,
+      { metric: "elcarehub_auction_bid_count", value: totalBids, auctionId },
+      { timeout: 5_000 },
+    )
+    .catch(() => {
+      // Silently swallow — metrics must never break user-facing flows.
+    });
+}
+
 /**
  * Fetch a single listing (with optional metadata) from the indexer.
  */
