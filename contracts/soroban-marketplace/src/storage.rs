@@ -88,6 +88,9 @@ pub enum DataKey {
     ArtistCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
+    /// Admin-configurable global default for new-auction bid history cap.
+    /// Stored as u32; defaults to `DEFAULT_BID_HISTORY_CAP` when absent.
+    BidHistoryCap,
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -813,4 +816,34 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
         env.storage().persistent().remove(key);
     }
     value
+}
+
+// ── Global bid-history cap ───────────────────────────────────
+
+/// Default bid history cap used when the admin has not configured a custom value.
+pub const DEFAULT_BID_HISTORY_CAP: u32 = 50;
+
+/// Hard upper-bound for the admin-configurable cap.  Keeps the per-auction
+/// Vec bounded and the O(n) eviction shift economically acceptable.
+pub const MAX_BID_HISTORY_CAP: u32 = 200;
+
+/// Persist the admin-chosen global bid history cap.
+pub fn set_bid_history_cap_storage(env: &Env, cap: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::BidHistoryCap, &cap);
+    bump_entry_ttl(env, &DataKey::BidHistoryCap);
+}
+
+/// Read the current global bid history cap.  Returns `DEFAULT_BID_HISTORY_CAP`
+/// when no custom value has been set yet.
+pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::BidHistoryCap);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::BidHistoryCap);
+    }
+    value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
 }

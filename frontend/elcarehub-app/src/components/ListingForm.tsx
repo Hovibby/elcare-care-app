@@ -4,18 +4,20 @@
 
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useCreateListing, useUpdateListing } from "@/hooks/useMarketplace";
 import { useWalletContext } from "@/context/WalletContext";
-import { Upload, CheckCircle, Loader2, Save, Plus, Trash2 } from "lucide-react";
+import { Upload, CheckCircle, Loader2, Save, Plus, Trash2, ShieldCheck, ShieldAlert } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
-import { Listing, stroopsToXlm } from "@/lib/contract";
+import { Listing, stroopsToXlm, isApprovedForAll, setApprovalForAll } from "@/lib/contract";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
+import { config } from "@/lib/config";
+import { getReadableErrorMessage } from "@/lib/errors";
 
 export const ART_CATEGORIES = [
   "Painting",
@@ -155,6 +157,184 @@ export function isFormValid(errors: FieldErrors): boolean {
   return !hasTopLevelError && !hasRowError;
 }
 
+// ── Marketplace approval ──────────────────────────────────────
+
+/**
+ * Possible states of the marketplace approval pre-check.
+ *
+ * idle       — collection address not yet valid; no check initiated.
+ * checking   — async `is_approved_for_all` read in flight.
+ * needed     — check complete; approval is absent / expired.
+ * approving  — `set_approval_for_all` transaction in flight.
+ * approved   — marketplace has an active grant; listing can proceed.
+ * error      — the check or grant call failed.
+ */
+export type ApprovalStatus =
+  | "idle"
+  | "checking"
+  | "needed"
+  | "approving"
+  | "approved"
+  | "error";
+
+/**
+ * Checks whether the marketplace contract already has `approval-for-all`
+ * from the seller on `collectionAddress`, and exposes a `grantApproval`
+ * action to request it when missing.
+ */
+function useMarketplaceApproval(
+  collectionAddress: string,
+  ownerPublicKey: string | null,
+) {
+  const [status, setStatus] = useState<ApprovalStatus>("idle");
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  const marketplaceAddress = config.contractId;
+
+  // Re-check whenever the collection address or wallet changes.
+  const check = useCallback(async () => {
+    if (!ownerPublicKey || !isValidStellarAddress(collectionAddress)) {
+      setStatus("idle");
+      return;
+    }
+    setStatus("checking");
+    setApprovalError(null);
+    try {
+      const already = await isApprovedForAll(
+        collectionAddress,
+        ownerPublicKey,
+        marketplaceAddress,
+      );
+      setStatus(already ? "approved" : "needed");
+    } catch (err) {
+      setStatus("error");
+      setApprovalError(getReadableErrorMessage(err, "Failed to check approval"));
+    }
+  }, [collectionAddress, ownerPublicKey, marketplaceAddress]);
+
+  useEffect(() => {
+    check();
+  }, [check]);
+
+  const grantApproval = useCallback(async () => {
+    if (!ownerPublicKey) return;
+    setStatus("approving");
+    setApprovalError(null);
+    try {
+      await setApprovalForAll(ownerPublicKey, collectionAddress, marketplaceAddress);
+      setStatus("approved");
+    } catch (err) {
+      setStatus("error");
+      setApprovalError(getReadableErrorMessage(err, "Approval transaction failed"));
+    }
+  }, [ownerPublicKey, collectionAddress, marketplaceAddress]);
+
+  return { status, approvalError, grantApproval, recheck: check };
+}
+
+// ── ApprovalBanner ────────────────────────────────────────────
+
+interface ApprovalBannerProps {
+  status: ApprovalStatus;
+  approvalError: string | null;
+  onApprove: () => void;
+  onRecheck: () => void;
+}
+
+function ApprovalBanner({
+  status,
+  approvalError,
+  onApprove,
+  onRecheck,
+}: ApprovalBannerProps) {
+  if (status === "idle" || status === "approved") return null;
+
+  if (status === "checking") {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex items-center gap-3 rounded-2xl bg-brand-50 border border-brand-100 px-5 py-4 text-sm text-brand-700"
+      >
+        <Loader2 size={18} className="animate-spin shrink-0 text-brand-500" />
+        <span className="font-semibold">Checking marketplace approval…</span>
+      </div>
+    );
+  }
+
+  if (status === "needed") {
+    return (
+      <div
+        role="alert"
+        className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 space-y-3"
+      >
+        <div className="flex items-start gap-3">
+          <ShieldAlert size={20} className="shrink-0 mt-0.5 text-amber-600" />
+          <div>
+            <p className="text-sm font-bold text-amber-900">
+              Marketplace approval required
+            </p>
+            <p className="text-xs text-amber-700 mt-0.5 leading-relaxed">
+              The marketplace needs a one-time permission to transfer this
+              collection on your behalf when a buyer purchases your listing.
+              This is a standard NFT marketplace approval — you can revoke it
+              at any time.
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onApprove}
+          className="flex items-center gap-2 rounded-xl bg-amber-500 hover:bg-amber-600 px-5 py-2.5 text-sm font-bold text-white transition-all shadow-sm shadow-amber-500/20"
+        >
+          <ShieldCheck size={16} />
+          Approve Marketplace
+        </button>
+      </div>
+    );
+  }
+
+  if (status === "approving") {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex items-center gap-3 rounded-2xl bg-amber-50 border border-amber-200 px-5 py-4 text-sm text-amber-800"
+      >
+        <Loader2 size={18} className="animate-spin shrink-0 text-amber-600" />
+        <span className="font-semibold">Requesting approval — sign in your wallet…</span>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div
+        role="alert"
+        className="rounded-2xl border border-red-200 bg-red-50 px-5 py-4 space-y-3"
+      >
+        <div className="flex items-start gap-3">
+          <ShieldAlert size={20} className="shrink-0 mt-0.5 text-red-600" />
+          <div>
+            <p className="text-sm font-bold text-red-900">Approval check failed</p>
+            {approvalError && (
+              <p className="text-xs text-red-700 mt-0.5">{approvalError}</p>
+            )}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onRecheck}
+          className="text-xs font-semibold text-red-600 hover:text-red-700 underline underline-offset-2"
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) {
   const isEdit = !!listing;
   const { publicKey } = useWalletContext();
@@ -177,6 +357,18 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   const [successId, setSuccessId] = useState<number | null>(null);
   const [currentMetadata, setCurrentMetadata] = useState<ArtworkMetadata | null>(null);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
+
+  // ── Marketplace approval pre-check (create-mode only) ─────
+  // In edit mode the NFT is already escrowed; re-approval is not needed.
+  const {
+    status: approvalStatus,
+    approvalError,
+    grantApproval,
+    recheck: recheckApproval,
+  } = useMarketplaceApproval(
+    isEdit ? "" : form.collectionAddress,
+    isEdit ? null : publicKey,
+  );
 
   const tokenOptions = listing
     ? ensureTokenOption(availableTokens, form.tokenAddress)
@@ -320,6 +512,17 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   const isLoading = isCreating || isUpdating || isFetchingMetadata;
   const progress = isEdit ? updateProgress : createProgress;
   const error = isEdit ? updateError : createError;
+
+  // In create mode, the submit button is disabled until the marketplace has
+  // approval-for-all for the selected collection.  We allow submit when:
+  //   - in edit mode (no approval check needed), OR
+  //   - the collection address is not yet valid (idle — user hasn't filled it in), OR
+  //   - approval is confirmed (approved).
+  // All other states (checking / needed / approving / error) block the submit.
+  const approvalBlocksSubmit =
+    !isEdit &&
+    approvalStatus !== "idle" &&
+    approvalStatus !== "approved";
 
   // ── Success screen ────────────────────────────────────────
 
@@ -650,6 +853,16 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             </p>
           )}
 
+          {/* Marketplace approval pre-check — create mode only */}
+          {!isEdit && (
+            <ApprovalBanner
+              status={approvalStatus}
+              approvalError={approvalError}
+              onApprove={grantApproval}
+              onRecheck={recheckApproval}
+            />
+          )}
+
           {/* Buttons */}
           <div className="flex flex-col sm:flex-row gap-4 pt-4">
             {isEdit && (
@@ -664,7 +877,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             )}
             <GuardButton
               type="submit"
-              disabled={isLoading || !hasTokenOptions || (submitAttempted && !formIsValid)}
+              disabled={isLoading || !hasTokenOptions || (submitAttempted && !formIsValid) || approvalBlocksSubmit}
               actionName={isEdit ? "to update your listing" : "to list your artwork"}
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >
