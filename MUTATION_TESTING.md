@@ -123,15 +123,105 @@ documented here._
 
 ---
 
+## Survivor Triage: keep / fix / retire
+
+A surviving mutant is a decision, not an open-ended backlog item. Every survivor
+from a `mutation-pr`, `mutation-full`, or `mutation-file` run gets exactly one
+disposition — **keep**, **fix**, or **retire** — recorded with enough evidence
+that a different reviewer reaches the same decision from the record alone.
+
+### Reproducible procedure
+
+1. **Collect the inputs** from the run artifact (`mutation-pr-<run_id>` /
+   `mutation-full-<run_id>`) or the local output directory:
+   - `mutation-tests/reports/survivors-<timestamp>.md` — the survivor list written by `run-mutation-tests.sh`
+   - `cargo-mutants-out/outcomes.json` — per-mutant outcome (`killed` / `survived` / `timeout` / `missed`)
+2. **Pick one survivor** and copy its `file`, function, and mutant text
+   **verbatim** from the report — never paraphrased, because the record must be
+   re-matchable against a later run.
+3. **Reproduce it on the same test family** with the narrowest matching mode:
+
+   ```bash
+   FILE=contracts/soroban-marketplace/src/math.rs bash mutation-tests/run-mutation-tests.sh   # single file
+   bash mutation-tests/run-mutation-tests.sh                                                  # PR mode (changed files)
+   FULL=1 bash mutation-tests/run-mutation-tests.sh                                           # nightly full run
+   ```
+
+   The mutant must still be listed as `survived`. If it cannot be reproduced,
+   record **retire** (invalid result) instead of guessing.
+4. **Decide** using the dispositions table below: equivalent behaviour → `keep`;
+   a test would catch it if it were stronger → `fix`; the result is noise or the
+   mutant is not observable at this layer → `retire`.
+5. **Record** the decision in the evidence record (template below): §Known Survivors
+   for `keep`, a test change for `fix`, a `mutants.toml` change for `retire`.
+6. **Re-run** the same command, capture the before/after score, and confirm the
+   module still meets its threshold.
+
+### Dispositions and required evidence
+
+| Decision | When it applies | Required evidence (every field mandatory) | Where the evidence lands |
+|---|---|---|---|
+| **keep** | The mutant is semantically equivalent — behaviour identical to the original in every reachable state | (a) verbatim mutant text + file/function; (b) the equivalence argument, naming the guard or invariant that makes the two forms indistinguishable and covering all reachable inputs; (c) test family run + reproduction command showing `survived`; (d) reviewer + date | Row in §Known Survivors with `Classification: Acceptable (semantically equivalent)` |
+| **fix** | The mutant exposes a **weak assertion** or a missing test — a real defect would survive | (a) verbatim mutant text; (b) the concrete input/behaviour a correct test must reject; (c) the assertion added or strengthened **in the same test family**; (d) re-run output showing this mutant moved to `killed` while the module still meets its threshold; (e) reviewer + date | Test change in the same PR + a row in §Known Survivors marked `Actionable → fixed` |
+| **retire** | The result is invalid, or the mutant is not observable at this layer — no unit test *should* catch it here | (a) verbatim mutant text; (b) why the signal is invalid (compile artifact, timeout noise, or layer mismatch such as behaviour covered by indexer integration tests rather than contract unit tests); (c) the `mutants.toml` change that removes it (`exclude_globs` / `skip_mutations`) with a rationale comment; (d) owner approval + quarterly review date | `mutants.toml` change + §Exclusions rationale + a row in §Known Survivors marked `Retired` |
+
+A decision missing any of its evidence fields is **not triaged**: the survivor stays
+open and continues to count against the module's threshold.
+
+### Evidence record template (copyable)
+
+```markdown
+| Mutant (verbatim) | Test family | Decision | Evidence summary | Repro command | Reviewer | Date |
+|---|---|---|---|---|---|---|
+| `<copy from survivors-<ts>.md>` | `<module + test fns>` | keep / fix / retire | `<for keep: equivalence argument; for fix: input + test changed + before/after score; for retire: invalidity reason + mutants.toml change>` | `FILE=<path> bash mutation-tests/run-mutation-tests.sh` | @<reviewer> | YYYY-MM-DD |
+```
+
+### Worked example — `calc_fee` boundary family (`math.rs`)
+
+Real test family: the `calc_fee` tests in
+[`contracts/soroban-marketplace/src/math.rs`](contracts/soroban-marketplace/src/math.rs)
+— `test_calc_fee_zero_price`, `test_calc_fee_zero_bps`, `test_calc_fee_normal`,
+`test_calc_fee_single_stroop_truncates`, `test_calc_fee_max_bps_equals_price`,
+`test_calc_fee_near_max_no_overflow`, `test_calc_fee_overflow_returns_zero`.
+The mutant below uses the operator from §Mutation Operator Reference (*replace
+boolean operator*); when triaging a live run, copy the mutant text verbatim from
+`survivors-<timestamp>.md`.
+
+| Field | Value |
+|---|---|
+| Mutant (verbatim) | `contracts/soroban-marketplace/src/math.rs` — `calc_fee`: replace `\|\|` with `&&` in `if bps == 0 \|\| price == 0` |
+| Outcome (why it surfaces) | `survived` — no test in the family can distinguish the two forms, so the suite passes either way |
+| Repro command | `FILE=contracts/soroban-marketplace/src/math.rs bash mutation-tests/run-mutation-tests.sh` |
+| Decision | **keep** |
+| Equivalence argument | With `&&` the guard fires only when *both* inputs are zero; otherwise control falls through to `price.checked_mul(bps).checked_div(10_000).unwrap_or(0)`. When either input is 0 the product is 0, multiplication by zero cannot overflow, and `0 / 10_000 == 0` — so `calc_fee` returns 0 on every input, exactly as the original guard does. No reachable `(price, bps)` pair distinguishes the two forms. |
+| Evidence lands | §Known Survivors → `math.rs`, `Classification: Acceptable (semantically equivalent)` |
+| Reviewer / date | `@<reviewer>` / `YYYY-MM-DD` |
+
+The same three-way test applies to the family's weak assertion:
+`test_calc_fee_near_max_no_overflow` only asserts `fee >= 0 && fee <= price`, so a
+mutant whose sole observable effect stays inside that range survives it — that
+record is a **fix** (tighten to an exact expected value), not a keep.
+
+**Retire precedent (real):** string-literal mutants inside `emit_*` event
+functions were retired through `[[skip_mutations]] source_file_re = "events\.rs$"`
+in `mutants.toml`, on the rationale that indexer integration tests — not contract
+unit tests — observe those strings. New retire decisions must follow the same
+pattern: config change + rationale comment + owner approval.
+
+---
+
 ## Recurring Survivor Ownership
 
 When a module's score drops below threshold in the nightly report, the owners
 listed in the module table above are responsible for:
 
 1. Reviewing the `mutation-tests/reports/survivors-<timestamp>.md` file.
-2. Determining whether each survivor is actionable or semantically equivalent.
-3. Either adding/strengthening a test (actionable) or documenting it here
-   (semantically equivalent) within **5 business days**.
+2. Triaging every survivor as **keep**, **fix**, or **retire** using
+   [Survivor Triage](#survivor-triage-keep--fix--retire), with the full evidence
+   set for that disposition.
+3. Landing the evidence (§Known Survivors row, a test change, or a `mutants.toml`
+   change) and re-running the same mode to capture the new score, within
+   **5 business days**.
 
 The nightly CI job posts a trend comment on the merge commit to make score
 changes visible without requiring direct inspection of the artifact.

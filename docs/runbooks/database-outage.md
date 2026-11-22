@@ -247,12 +247,84 @@ psql "$DATABASE_URL" -c "
 
 ---
 
+## Restore Drill: Exercising a Backup in a Disposable Environment
+
+A backup is not verified until a restore has been exercised in a disposable
+environment. The `db-backup` workflow performs that restore automatically after
+every backup (`verify-restore` job), but the drill itself must be scheduled,
+evidenced, and repeatable. This section is the drill runbook; it uses the existing
+`db-backup` workflow and this runbook only — no new tooling, no production writes.
+
+### Prerequisites
+
+| # | Prerequisite | How to confirm |
+|---|---|---|
+| 1 | `db-backup` workflow exists with its `verify-restore` job (`.github/workflows/db-backup.yml`) | File present; latest run shows the `Restore Verification (DR Drill)` job |
+| 2 | Required Actions secrets configured: `BACKUP_DATABASE_URL`, `BACKUP_ENCRYPTION_KEY` (optional: `METRICS_PUSH_URL`, `ALERT_WEBHOOK_URL`) | The `PostgreSQL Backup` job passes its "Run backup" step |
+| 3 | Disposable restore target: the CI `postgres:15-alpine` service container, a local Docker database, or a staging database — **never production** | `RESTORE_TARGET_URL` points at a `localhost` / staging host, not the production host |
+| 4 | Helper scripts present and syntax-clean | `bash -n scripts/backup/backup.sh scripts/backup/restore.sh` |
+| 5 | Operator can open Actions run logs and download the backup artifact | Run URL loads; artifact `db-backup-<run_id>` listed |
+
+**Credentials stay outside the repository.** The production connection string and
+the encryption passphrase exist only as GitHub Actions secrets (and the operator's
+password manager). They are never committed, never echoed by `backup.sh` /
+`restore.sh`, and never recorded in this runbook, an issue, or a drill report — use
+placeholders such as `<RUN_URL>` and `<BACKUP_ARTIFACT_NAME>`, as the
+[Backup Retention Verification Report](../reliability/backup-retention-verification-report.md)
+requires. The disposable target uses throwaway drill credentials only.
+
+### Procedure
+
+1. **Trigger** — Actions → *Database Backup* → *Run workflow* (`workflow_dispatch`), or wait for the nightly `0 2 * * *` schedule.
+2. **Backup** — the `backup` job produces `pg_backup_<timestamp>.dump.enc` plus its `.sha256` and uploads artifact `db-backup-<run_id>` (90-day retention, `if-no-files-found: error`).
+3. **Restore (disposable)** — the `verify-restore` job starts a throwaway `postgres:15-alpine` container (`restore_test` user/database on the job-local network), downloads the artifact, and runs `scripts/backup/restore.sh`: checksum verification → encryption header check → `pg_restore --clean --if-exists` → `prisma migrate deploy` → read checks (`Listing`, `Auction`, `Offer`, `MarketplaceEvent`, `SyncState`).
+4. **Evidence** — the job summary renders the *DB Restore Verification* table and `restore.sh` prints `[report] RESULT: PASS`. Only aggregate numeric metrics go to the optional Pushgateway.
+5. **Operator drill (optional local equivalent)** — run the same script against a disposable target:
+
+   ```bash
+   export BACKUP_FILE=/path/to/pg_backup_<timestamp>.dump.enc   # downloaded CI artifact
+   export BACKUP_ENCRYPTION_KEY='<from the password manager — never commit>'
+   export RESTORE_TARGET_URL='postgresql://<drill_user>:<drill_pass>@localhost:5432/drill_db'
+   bash scripts/backup/restore.sh
+   ```
+
+### Success criteria
+
+The drill passes only when **all** of the following hold. Each row is measurable
+from the workflow run or the local script output:
+
+| # | Criterion | Measured by |
+|---|---|---|
+| 1 | Encrypted artifact + checksum produced | `db-backup-<run_id>` artifact exists (`if-no-files-found: error`) |
+| 2 | Checksum verified | `restore.sh` checksum step reports `ok`; script exit code `0` |
+| 3 | Encryption passphrase correct | header decrypt check passes |
+| 4 | Restore completed | `pg_restore complete (<n>s)` in the log |
+| 5 | Schema current on target | `prisma migrate deploy` status `ok` |
+| 6 | Data readable | read checks return row counts and `lastLedger` with no `ERROR` |
+| 7 | Backup is fresh | artifact age < 25 hours (the `restore.sh` warning threshold; ≥ 25 h means a scheduled run was missed → escalate) |
+| 8 | Overall verdict | `Restore Verification (DR Drill)` job = success **and** `[report] RESULT: PASS` |
+
+Any failed row = drill failure: treat the newest backup as **unverified** and
+escalate per the table below. Artifact presence alone never counts as verification.
+
+### Ownership, trigger, expected output, rollback / escalation
+
+| | |
+|---|---|
+| **Owner** | DevOps Engineer (primary — see [Owner & Contacts](#owner--contacts)); Backend Lead (secondary) |
+| **Trigger** | Nightly `0 2 * * *` schedule; manual `workflow_dispatch`; quarterly drill evidence recorded in the [Backup Retention Verification Report](../reliability/backup-retention-verification-report.md) |
+| **Expected output** | Green `verify-restore` job, `[report] RESULT: PASS`, job-summary table, artifact retained 90 days, drill report filed with placeholders only |
+| **Rollback / remediation** | The drill only ever writes to a disposable database: tear the target down (`docker compose down -v` for a local target) and discard the throwaway credentials. No production state is modified, so there is nothing to roll back in production. If the artifact itself is suspect, re-run the `db-backup` workflow to produce a fresh one |
+| **Escalation** | Failed or red `verify-restore` → DevOps (Slack `#alerts`, `ops@elcarehub.xyz`); still failing after one re-run → Backend Lead (phone, urgent); a missed 02:00 run or artifact age ≥ 25 h → inspect workflow run history and re-run `db-backup` before relying on that backup for DR |
+
+---
+
 ## Prohibited Actions
 
 - ❌ Do not run `DROP TABLE`, `TRUNCATE`, or delete indexes during recovery
 - ❌ Do not change `DATABASE_URL` to a different database without migrating schema
 - ❌ Do not apply Prisma migrations while an outage is active
-- ❌ Do not restore from backup without stopping the indexer first
+- ❌ Do not restore from backup without stopping the indexer first (applies to the live/staging database — a disposable drill target is unaffected, see [Restore Drill](#restore-drill-exercising-a-backup-in-a-disposable-environment))
 
 ---
 

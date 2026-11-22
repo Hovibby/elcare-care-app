@@ -219,10 +219,16 @@ cat > "${SURVIVORS_FILE}" <<SURVIVORS_MD
 > Run mode: ${FULL:+full scheduled}${EXPLICIT_FILE:+single-file}${FULL:-${EXPLICIT_FILE:-PR}}
 > Total survivors: ${SURVIVED_COUNT}
 
-${SURVIVED_COUNT} mutant(s) survived this run. Each represents a potential test gap.
-For each survivor, determine whether:
-  1. The mutant is semantically equivalent (acceptable — document in MUTATION_TESTING.md §Known Survivors)
-  2. A new or strengthened test would catch it (action required)
+${SURVIVED_COUNT} mutant(s) survived this run. Each needs exactly one triage
+decision — keep, fix, or retire — with the evidence defined in
+MUTATION_TESTING.md §Survivor Triage:
+
+  keep   — semantically equivalent mutant; record the equivalence argument in
+           MUTATION_TESTING.md §Known Survivors
+  fix    — weak assertion or missing test; add or strengthen a test in the same
+           family, then re-run until the mutant is killed
+  retire — invalid or unobservable-at-this-layer result; exclude it in
+           mutants.toml with a rationale comment and owner approval
 
 ## Survivor Details
 
